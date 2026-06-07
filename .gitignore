@@ -1,0 +1,49 @@
+# JARVIS .gitignore
+
+# Snaps e backups
+/Snapshots/
+/_latest
+
+# Logs
+/Logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Sistema / Windows
+Thumbs.db
+Desktop.ini
+*.lnk
+*.regtrans-ms
+NTUSER.DAT*
+ntuser.*
+
+# Dependências e ambientes
+.venv/
+venv/
+.env
+.env.local
+
+# Editores
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node (se usar)
+node_modules/
+
+# Git
+.git/
+
+# Geradores externos (não versionar saídas)
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.mp3
+*.wav
+/Downloads/
