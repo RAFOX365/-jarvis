@@ -5,10 +5,21 @@ import time
 import threading
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 VAULT = r"C:\Users\rafox\Documents\planodecultivo\thcLab\JARVIS"
 __version__ = "3.2.0"
+
+
+def _parse_version(version_str: str) -> List[int]:
+    try:
+        return [int(x) for x in version_str.split(".")]
+    except ValueError:
+        return [0, 0, 0]
+
+
+def _gte(min_version: str, target: str) -> bool:
+    return _parse_version(min_version) <= _parse_version(target)
 
 
 # -------------------------
@@ -32,7 +43,6 @@ class EventEmitter:
         payload = payload or {}
         payload.setdefault("timestamp", datetime.now().isoformat())
         payload.setdefault("event", event)
-        payload.setdefault("version", __version__)
         with self._lock:
             callbacks = list(self._listeners.get(event, []))
         for cb in callbacks:
@@ -61,10 +71,8 @@ def _ok(data: Any = None) -> Dict[str, Any]:
 def _safe_name(name: str) -> bool:
     if not name:
         return False
-    # bloqueia apenas path traversal e chars perigosos
     if ".." in name or name.startswith("/") or name.startswith("\\"):
         return False
-    # aceita alfanumerico, hifen, underline
     if not all(c.isalnum() or c in "-_" for c in name):
         return False
     return True
@@ -101,7 +109,7 @@ class JarvisCoreV32:
         (self.vault / "Logs").mkdir(parents=True, exist_ok=True)
 
     # -------------------------
-    # SAFE LOGGER (carregado do vault)
+    # SAFE LOGGER
     # -------------------------
     def _load_safe_logger(self):
         candidate = self.skills_path / "safe-logger.py"
@@ -119,7 +127,20 @@ class JarvisCoreV32:
         self.skills["safe-logger"] = mod
 
     # -------------------------
-    # HOOKS DEFAULT
+    # SKILL VALIDATORS
+    # -------------------------
+    def _check_dependencies(self, dependencies: List[str]) -> Tuple[List[str], List[str]]:
+        missing = []
+        installed = []
+        for dep in dependencies:
+            if importlib.util.find_spec(dep) is None:
+                missing.append(dep)
+            else:
+                installed.append(dep)
+        return missing, installed
+
+    # -------------------------
+    # HOOKS
     # -------------------------
     def _register_default_hooks(self):
         self.events.on("SKILL_LOADED", lambda p: self.logger.write(
@@ -150,13 +171,11 @@ class JarvisCoreV32:
         if not self.skills_path.exists():
             return
 
-        # se for reload, limpa skills antigas (menos safe-logger)
         if reload:
             to_remove = [k for k in self.skills if k != "safe-logger"]
             for k in to_remove:
                 del self.skills[k]
                 self.skill_meta.pop(k, None)
-            # limpa cache do importlib
             for key in list(sys.modules.keys()):
                 if key.startswith("Skills.") or key.startswith("jarvis_skill_"):
                     del sys.modules[key]
@@ -178,19 +197,34 @@ class JarvisCoreV32:
                 sys.modules[spec.name] = module
                 spec.loader.exec_module(module)
 
-                self.skills[name] = module
-                meta = {
-                    "name": name,
-                    "file": str(file),
-                    "module": module_name
-                }
                 if hasattr(module, "info") and callable(module.info):
-                    try:
-                        info_data = module.info()
-                        if isinstance(info_data, dict):
-                            meta.update(info_data)
-                    except Exception:
-                        pass
+                    meta = module.info()
+                    if not isinstance(meta, dict):
+                        raise TypeError("info() deve retornar dict")
+                else:
+                    meta = {"name": name}
+
+                meta.setdefault("name", name)
+                meta.setdefault("version", "0.0.0")
+                meta.setdefault("actions", [])
+                meta.setdefault("dependencies", [])
+                meta.setdefault("core_min_version", "1.0.0")
+
+                skill_min_core = meta.get("core_min_version", "1.0.0")
+                if not _gte(skill_min_core, __version__):
+                    self.events.emit("SKILL_LOAD_FAIL", {
+                        "skill": name,
+                        "error": f"Core v{__version__} < skill_min {skill_min_core}"
+                    })
+                    continue
+
+                missing_deps, _ = self._check_dependencies(meta.get("dependencies", []))
+                if missing_deps:
+                    raise EnvironmentError(
+                        f"Dependências ausentes: {missing_deps}. Instale com: pip install {' '.join(missing_deps)}"
+                    )
+
+                self.skills[name] = module
                 self.skill_meta[name] = meta
 
                 self.events.emit("SKILL_LOADED", {
@@ -214,8 +248,6 @@ class JarvisCoreV32:
         timeout: Optional[float] = None,
         **kwargs
     ) -> Dict[str, Any]:
-        t0 = time.perf_counter()
-
         if not _safe_name(skill_name) or not _safe_name(action):
             return _fail("invalid_name")
 
@@ -236,7 +268,7 @@ class JarvisCoreV32:
             method = getattr(skill, action)
             result = method(**kwargs)
 
-            elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+            elapsed_ms = round((time.perf_counter() - time.perf_counter()) * 1000, 2)
             event_payload = {
                 "skill": skill_name,
                 "action": action,
@@ -253,7 +285,7 @@ class JarvisCoreV32:
             }
 
         except Exception as e:
-            elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+            elapsed_ms = round((time.perf_counter() - time.perf_counter()) * 1000, 2)
             event_payload = {
                 "skill": skill_name,
                 "action": action,
@@ -294,8 +326,8 @@ class JarvisCoreV32:
             counts[event] = len(cbs)
             listeners[event] = len(cbs)
         return {
-            "total_events": len(self.events._listeners),
-            "listeners": listeners,
+            "total_listeners": sum(listeners.values()),
+            "events": listeners,
             "skills_loaded": len(self.skills),
             "skills": list(self.skills.keys())
         }
@@ -322,10 +354,8 @@ class JarvisCoreV32:
 # -------------------------
 if __name__ == "__main__":
     with JarvisCoreV32() as core:
-        print(f"JARVIS CORE v{__version__}")
+        print("JARVIS CORE v3.2")
         print("Skills:", core.list_skills())
         print("Event stats:", core.get_event_stats())
-        if "obsidian-brain" in core.skills:
-            print("obsidian actions:", core.list_actions("obsidian-brain"))
-        if "git-ops" in core.skills:
-            print("git actions:", core.list_actions("git-ops"))
+        for name in core.list_skills():
+            print(f"{name} actions:", core.list_actions(name))
