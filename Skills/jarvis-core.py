@@ -4,10 +4,12 @@ import json
 import time
 import threading
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 VAULT = r"C:\Users\rafox\Documents\planodecultivo\thcLab\JARVIS"
+__version__ = "3.3.0"
 __version__ = "3.2.0"
 
 
@@ -26,9 +28,11 @@ def _gte(min_version: str, target: str) -> bool:
 # EVENT SYSTEM
 # -------------------------
 class EventEmitter:
-    def __init__(self):
+    def __init__(self, max_workers: int = 8):
         self._listeners: Dict[str, List[Callable]] = {}
         self._lock = threading.Lock()
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._futures: Dict[str, Future] = {}
 
     def on(self, event: str, callback: Callable):
         if event not in self._listeners:
@@ -39,18 +43,39 @@ class EventEmitter:
         if event in self._listeners:
             self._listeners[event] = [cb for cb in self._listeners[event] if cb != callback]
 
-    def emit(self, event: str, payload: Optional[Dict[str, Any]] = None):
-        payload = payload or {}
-        payload.setdefault("timestamp", datetime.now().isoformat())
-        payload.setdefault("event", event)
-        with self._lock:
-            callbacks = list(self._listeners.get(event, []))
+    def _invoke(self, callbacks, payload):
         for cb in callbacks:
             try:
                 cb(payload)
             except Exception:
                 pass
         return payload
+
+    def emit(self, event: str, payload: Optional[Dict[str, Any]] = None):
+        payload = payload or {}
+        payload.setdefault("timestamp", datetime.now().isoformat())
+        payload.setdefault("event", event)
+        with self._lock:
+            callbacks = list(self._listeners.get(event, []))
+            self._futures.pop(event, None)
+        future = self._executor.submit(self._invoke, callbacks, payload)
+        self._futures[event] = future
+        return payload
+
+    def emit_sync(self, event: str, payload: Optional[Dict[str, Any]] = None):
+        payload = payload or {}
+        payload.setdefault("timestamp", datetime.now().isoformat())
+        payload.setdefault("event", event)
+        with self._lock:
+            callbacks = list(self._listeners.get(event, []))
+        return self._invoke(callbacks, payload)
+
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False):
+        try:
+            self._executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+        except Exception:
+            pass
+        self._futures.clear()
 
 
 # -------------------------
@@ -336,10 +361,21 @@ class JarvisCoreV32:
     # SHUTDOWN / CONTEXT MANAGER
     # -------------------------
     def close(self):
-        self.events.emit("CORE_SHUTDOWN", {
-            "vault": str(self.vault),
-            "skills_loaded": len(self.skills)
-        })
+        try:
+            self.events.emit("CORE_SHUTDOWN", {
+                "vault": str(self.vault),
+                "skills_loaded": len(self.skills)
+            })
+        except Exception:
+            pass
+        try:
+            self.events.shutdown(wait=False)
+        except Exception:
+            pass
+        try:
+            self.logger.close()
+        except Exception:
+            pass
 
     def __enter__(self):
         return self
