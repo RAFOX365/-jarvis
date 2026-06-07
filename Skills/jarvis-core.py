@@ -3,6 +3,7 @@ import sys
 import json
 import time
 import threading
+import uuid
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime
@@ -10,9 +11,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 VAULT = r"C:\Users\rafox\Documents\planodecultivo\thcLab\JARVIS"
 __version__ = "3.3.0"
-__version__ = "3.2.0"
 
 
+# -------------------------
+# VERSION UTILS
+# -------------------------
 def _parse_version(version_str: str) -> List[int]:
     try:
         return [int(x) for x in version_str.split(".")]
@@ -55,6 +58,7 @@ class EventEmitter:
         payload = payload or {}
         payload.setdefault("timestamp", datetime.now().isoformat())
         payload.setdefault("event", event)
+        payload.setdefault("event_id", str(uuid.uuid4()))
         with self._lock:
             callbacks = list(self._listeners.get(event, []))
             self._futures.pop(event, None)
@@ -66,6 +70,7 @@ class EventEmitter:
         payload = payload or {}
         payload.setdefault("timestamp", datetime.now().isoformat())
         payload.setdefault("event", event)
+        payload.setdefault("event_id", str(uuid.uuid4()))
         with self._lock:
             callbacks = list(self._listeners.get(event, []))
         return self._invoke(callbacks, payload)
@@ -190,6 +195,48 @@ class JarvisCoreV32:
         ))
 
     # -------------------------
+    # ACTION ROUTER
+    # -------------------------
+    def _register_action_routes(self, skill_name: str, module: Any, actions: List[str]):
+        if not hasattr(module, "execute") or not callable(module.execute):
+            self.logger.write(
+                "SKILL_LOAD_FAIL",
+                {"skill": skill_name, "error": "missing_unified_execute"},
+                level="ERROR"
+            )
+            return False
+
+        for action_str in actions:
+            event_name = f"action:{action_str}"
+
+            def make_handler(act=action_str, mod=module, name=skill_name):
+                def event_handler(context_data: dict):
+                    self.logger.write(
+                        "ACTION_DISPATCH",
+                        {"skill": name, "action": act},
+                        level="INFO"
+                    )
+                    try:
+                        return mod.execute(act, context_data)
+                    except Exception as e:
+                        self.logger.write(
+                            "ACTION_ERROR",
+                            {"skill": name, "action": act, "error": str(e)},
+                            level="ERROR"
+                        )
+                        raise
+                return event_handler
+
+            self.events.on(event_name, make_handler())
+            self.logger.write(
+                "ROUTE_REGISTERED",
+                {"event": event_name, "skill": skill_name},
+                level="INFO"
+            )
+
+        return True
+
+    # -------------------------
     # LOAD SKILLS
     # -------------------------
     def load_skills(self, reload: bool = False):
@@ -251,6 +298,8 @@ class JarvisCoreV32:
 
                 self.skills[name] = module
                 self.skill_meta[name] = meta
+
+                self._register_action_routes(name, module, meta.get("actions", []))
 
                 self.events.emit("SKILL_LOADED", {
                     "skill": name,
@@ -390,7 +439,7 @@ class JarvisCoreV32:
 # -------------------------
 if __name__ == "__main__":
     with JarvisCoreV32() as core:
-        print("JARVIS CORE v3.2")
+        print(f"JARVIS CORE v{__version__}")
         print("Skills:", core.list_skills())
         print("Event stats:", core.get_event_stats())
         for name in core.list_skills():
