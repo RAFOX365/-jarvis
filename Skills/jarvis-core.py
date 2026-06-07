@@ -1,195 +1,331 @@
-import os
-import sys
 import importlib.util
+import sys
 import json
-import platform
+import time
+import threading
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 VAULT = r"C:\Users\rafox\Documents\planodecultivo\thcLab\JARVIS"
-SKILLS_PATH = Path(VAULT) / "Skills"
-LOG_PATH = Path(VAULT) / "Logs" / "core.log.jsonl"
-__version__ = "3.1.0"
+__version__ = "3.2.0"
+
+
+# -------------------------
+# EVENT SYSTEM
+# -------------------------
+class EventEmitter:
+    def __init__(self):
+        self._listeners: Dict[str, List[Callable]] = {}
+        self._lock = threading.Lock()
+
+    def on(self, event: str, callback: Callable):
+        if event not in self._listeners:
+            self._listeners[event] = []
+        self._listeners[event].append(callback)
+
+    def off(self, event: str, callback: Callable):
+        if event in self._listeners:
+            self._listeners[event] = [cb for cb in self._listeners[event] if cb != callback]
+
+    def emit(self, event: str, payload: Optional[Dict[str, Any]] = None):
+        payload = payload or {}
+        payload.setdefault("timestamp", datetime.now().isoformat())
+        payload.setdefault("event", event)
+        payload.setdefault("version", __version__)
+        with self._lock:
+            callbacks = list(self._listeners.get(event, []))
+        for cb in callbacks:
+            try:
+                cb(payload)
+            except Exception:
+                pass
+        return payload
 
 
 # -------------------------
 # UTIL
 # -------------------------
-def now():
+def _now_iso() -> str:
     return datetime.now().isoformat()
 
 
-def _truncate(value: str, max_chars: int = 500) -> str:
-    if len(value) <= max_chars:
-        return value
-    return value[:max_chars] + "...[truncated]"
+def _fail(error: str) -> Dict[str, Any]:
+    return {"ok": False, "error": error}
+
+
+def _ok(data: Any = None) -> Dict[str, Any]:
+    return {"ok": True, "data": data}
+
+
+def _safe_name(name: str) -> bool:
+    if not name:
+        return False
+    # bloqueia apenas path traversal e chars perigosos
+    if ".." in name or name.startswith("/") or name.startswith("\\"):
+        return False
+    # aceita alfanumerico, hifen, underline
+    if not all(c.isalnum() or c in "-_" for c in name):
+        return False
+    return True
 
 
 # -------------------------
 # CORE ENGINE
 # -------------------------
-class JarvisCore:
+class JarvisCoreV32:
 
     def __init__(self, vault_path: str = VAULT):
         self.vault = Path(vault_path).resolve()
         self.skills_path = self.vault / "Skills"
+        self.logs_path = self.vault / "Logs" / "core.log.jsonl"
+        self.events = EventEmitter()
         self.skills: Dict[str, Any] = {}
-        self.host = platform.node()
-        self.user = os.getenv("USERNAME") or os.getenv("USER") or "unknown"
+        self.skill_meta: Dict[str, Dict[str, Any]] = {}
+
+        self._ensure_structure()
+        self._load_safe_logger()
+        self._register_default_hooks()
         self.load_skills()
 
+        self.events.emit("CORE_INIT", {
+            "vault": str(self.vault),
+            "version": __version__
+        })
+
     # -------------------------
-    # LOAD SKILLS DINAMICAMENTE
+    # ESTRUTURA
     # -------------------------
-    def load_skills(self):
+    def _ensure_structure(self):
+        (self.vault / "Skills").mkdir(parents=True, exist_ok=True)
+        (self.vault / "Logs").mkdir(parents=True, exist_ok=True)
+
+    # -------------------------
+    # SAFE LOGGER (carregado do vault)
+    # -------------------------
+    def _load_safe_logger(self):
+        candidate = self.skills_path / "safe-logger.py"
+        if not candidate.exists():
+            raise FileNotFoundError(f"SafeLogger não encontrado em {candidate}")
+
+        spec = importlib.util.spec_from_file_location("safe_logger", candidate)
+        if spec is None or spec.loader is None:
+            raise ImportError("spec inválido para safe-logger")
+
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        self.logger = mod.SafeLogger(path=self.logs_path)
+        self.skills["safe-logger"] = mod
+
+    # -------------------------
+    # HOOKS DEFAULT
+    # -------------------------
+    def _register_default_hooks(self):
+        self.events.on("SKILL_LOADED", lambda p: self.logger.write(
+            "SKILL_LOADED", {"skill": p.get("skill")}, level="INFO"
+        ))
+        self.events.on("SKILL_LOAD_FAIL", lambda p: self.logger.write(
+            "SKILL_LOAD_FAIL", {"skill": p.get("skill"), "error": p.get("error")}, level="ERROR"
+        ))
+        self.events.on("SKILL_EXEC", lambda p: self.logger.write(
+            "SKILL_EXEC", {
+                "skill": p.get("skill"),
+                "action": p.get("action"),
+                "elapsed_ms": p.get("elapsed_ms")
+            }, level="INFO"
+        ))
+        self.events.on("SKILL_ERROR", lambda p: self.logger.write(
+            "SKILL_ERROR", {
+                "skill": p.get("skill"),
+                "action": p.get("action"),
+                "error": p.get("error")
+            }, level="ERROR"
+        ))
+
+    # -------------------------
+    # LOAD SKILLS
+    # -------------------------
+    def load_skills(self, reload: bool = False):
         if not self.skills_path.exists():
-            self.skills_path.mkdir(parents=True, exist_ok=True)
+            return
+
+        # se for reload, limpa skills antigas (menos safe-logger)
+        if reload:
+            to_remove = [k for k in self.skills if k != "safe-logger"]
+            for k in to_remove:
+                del self.skills[k]
+                self.skill_meta.pop(k, None)
+            # limpa cache do importlib
+            for key in list(sys.modules.keys()):
+                if key.startswith("Skills.") or key.startswith("jarvis_skill_"):
+                    del sys.modules[key]
 
         for file in sorted(self.skills_path.glob("*.py")):
             name = file.stem
-
-            if name.startswith("__"):
+            if not _safe_name(name):
+                continue
+            if name in self.skills and not reload:
                 continue
 
             try:
-                spec = importlib.util.spec_from_file_location(f"jarvis_skill_{name}", file)
+                module_name = f"Skills.{name}"
+                spec = importlib.util.spec_from_file_location(module_name, file)
                 if spec is None or spec.loader is None:
-                    continue
+                    raise ImportError("spec inválido")
 
                 module = importlib.util.module_from_spec(spec)
                 sys.modules[spec.name] = module
                 spec.loader.exec_module(module)
 
                 self.skills[name] = module
-                self._log("SKILL_LOADED", {"skill": name, "file": str(file)})
-            except Exception as e:
-                self._log("SKILL_FAIL", {
+                meta = {
+                    "name": name,
+                    "file": str(file),
+                    "module": module_name
+                }
+                if hasattr(module, "info") and callable(module.info):
+                    try:
+                        info_data = module.info()
+                        if isinstance(info_data, dict):
+                            meta.update(info_data)
+                    except Exception:
+                        pass
+                self.skill_meta[name] = meta
+
+                self.events.emit("SKILL_LOADED", {
                     "skill": name,
-                    "error": str(e),
-                    "file": str(file)
+                    "meta": meta
+                })
+
+            except Exception as e:
+                self.events.emit("SKILL_LOAD_FAIL", {
+                    "skill": name,
+                    "error": str(e)
                 })
 
     # -------------------------
-    # RELOAD SKILLS
+    # EXECUTION ENGINE
     # -------------------------
-    def reload_skills(self) -> Dict[str, str]:
-        results = {}
-        for name, module in list(self.skills.items()):
-            try:
-                importlib.reload(module)
-                results[name] = "reloaded"
-            except Exception as e:
-                results[name] = f"error: {str(e)}"
-        self._log("SKILL_RELOAD", results)
-        return results
+    def run_skill(
+        self,
+        skill_name: str,
+        action: str,
+        timeout: Optional[float] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        t0 = time.perf_counter()
 
-    # -------------------------
-    # EXECUTOR DE SKILL
-    # -------------------------
-    def run_skill(self, skill_name: str, action: str, **kwargs) -> Any:
-        if not self._valid_skill_name(skill_name):
-            error = f"invalid_skill_name: {skill_name}"
-            self._log("SKILL_EXEC_ERROR", error)
-            return {"error": error}
+        if not _safe_name(skill_name) or not _safe_name(action):
+            return _fail("invalid_name")
 
         if skill_name not in self.skills:
-            error = f"skill_not_found: {skill_name}"
-            self._log("SKILL_EXEC_ERROR", error)
-            return {"error": error}
+            return _fail("skill_not_found")
 
         skill = self.skills[skill_name]
-
         if not hasattr(skill, action):
-            available = [
-                m for m in dir(skill)
-                if not m.startswith("_") and callable(getattr(skill, m))
-            ]
-            error = {
+            return {
                 "error": "action_not_found",
-                "action": action,
-                "available_actions": available
+                "available_actions": [
+                    m for m in dir(skill)
+                    if not m.startswith("_") and callable(getattr(skill, m))
+                ]
             }
-            self._log("SKILL_EXEC_ERROR", error)
-            return error
 
         try:
             method = getattr(skill, action)
             result = method(**kwargs)
-            self._log("SKILL_EXEC", {
+
+            elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+            event_payload = {
                 "skill": skill_name,
                 "action": action,
-                "args": kwargs,
-                "result": _truncate(str(result), 500)
-            })
-            return result
-        except TypeError as e:
-            error = {
-                "error": "invalid_args",
-                "detail": str(e)
+                "elapsed_ms": elapsed_ms,
+                "result": str(result)[:500]
             }
-            self._log("SKILL_EXEC_ERROR", error)
-            return error
+            self.events.emit("SKILL_EXEC", event_payload)
+
+            return {
+                "ok": True,
+                "event_id": event_payload.get("timestamp"),
+                "execution_time_ms": elapsed_ms,
+                "result": result
+            }
+
         except Exception as e:
-            error = {
-                "error": "exec_exception",
-                "detail": str(e)
+            elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+            event_payload = {
+                "skill": skill_name,
+                "action": action,
+                "error": str(e),
+                "elapsed_ms": elapsed_ms
             }
-            self._log("SKILL_EXEC_ERROR", error)
-            return error
+            self.events.emit("SKILL_ERROR", event_payload)
+
+            return {
+                "ok": False,
+                "event_id": event_payload.get("timestamp"),
+                "execution_time_ms": elapsed_ms,
+                "error": str(e)
+            }
 
     # -------------------------
-    # LISTAGENS
+    # INSPECTION
     # -------------------------
     def list_skills(self) -> List[str]:
         return sorted(self.skills.keys())
 
-    # -------------------------
-    # LOG INTERNO
-    # -------------------------
-    def _log(self, event: str, data: Any):
-        entry = {
-            "time": now(),
-            "event": event,
-            "data": data,
-            "host": self.host,
-            "user": self.user,
-            "version": __version__
+    def list_actions(self, skill_name: str) -> List[str]:
+        if skill_name not in self.skills:
+            return []
+        skill = self.skills[skill_name]
+        return [
+            m for m in dir(skill)
+            if not m.startswith("_") and callable(getattr(skill, m))
+        ]
+
+    def get_skill_meta(self, skill_name: str) -> Dict[str, Any]:
+        return self.skill_meta.get(skill_name, {})
+
+    def get_event_stats(self) -> Dict[str, Any]:
+        counts: Dict[str, int] = {}
+        listeners: Dict[str, int] = {}
+        for event, cbs in self.events._listeners.items():
+            counts[event] = len(cbs)
+            listeners[event] = len(cbs)
+        return {
+            "total_events": len(self.events._listeners),
+            "listeners": listeners,
+            "skills_loaded": len(self.skills),
+            "skills": list(self.skills.keys())
         }
 
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    # -------------------------
+    # SHUTDOWN / CONTEXT MANAGER
+    # -------------------------
+    def close(self):
+        self.events.emit("CORE_SHUTDOWN", {
+            "vault": str(self.vault),
+            "skills_loaded": len(self.skills)
+        })
 
-        return entry
+    def __enter__(self):
+        return self
 
-
-    def _valid_skill_name(self, name: str) -> bool:
-        if not name:
-            return False
-        if name.startswith(".") or name.startswith("_"):
-            return False
-        if ".." in name or "/" in name or "\\" in name:
-            return False
-        return True
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
 
 # -------------------------
 # BOOT
 # -------------------------
 if __name__ == "__main__":
-    jarvis = JarvisCore()
-
-    print(f"JARVIS CORE v{__version__} iniciado")
-    print("Skills carregadas:", jarvis.list_skills())
-
-    # teste: listar notes do Memory via obsidian-brain
-    if "obsidian-brain" in jarvis.skills:
-        result = jarvis.run_skill("obsidian-brain", "list_notes", folder="Memory")
-        print("\nMemory notes:", result)
-    else:
-        print("\n[AVISO] obsidian-brain nao encontrada em skills")
-
-    # teste: verificar vault
-    result = jarvis.run_skill("obsidian-brain", "verify_vault")
-    print("\nverify_vault:", result)
+    with JarvisCoreV32() as core:
+        print(f"JARVIS CORE v{__version__}")
+        print("Skills:", core.list_skills())
+        print("Event stats:", core.get_event_stats())
+        if "obsidian-brain" in core.skills:
+            print("obsidian actions:", core.list_actions("obsidian-brain"))
+        if "git-ops" in core.skills:
+            print("git actions:", core.list_actions("git-ops"))
