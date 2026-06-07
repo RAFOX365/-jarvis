@@ -1,0 +1,20 @@
+# Git attributes — normalize line endings/encoding to keep diffs clean on Windows
+
+# Markdown text files — normalize line endings to LF in the repo
+*.md text eol=lf
+
+# Python stays UTF-8 with LF
+*.py text eol=lf encoding=utf-8
+
+# JSON/JSONL should not be treated as binary merge artifacts
+*.json text eol=lf
+*.jsonl text eol=lf
+
+# Binaries
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.mp4 binary
+*.mp3 binary
+*.wav binary
