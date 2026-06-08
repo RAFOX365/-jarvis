@@ -35,8 +35,11 @@ class KnowledgeGraph:
                 self.edges.append(entry)
 
     def add_node(self, node_type: str, data: Dict[str, Any]) -> Optional[str]:
-        raw = json.dumps({"type": node_type, "data": data}, sort_keys=True, ensure_ascii=False)
-        node_id = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+        # Prefer canonical hash from payload so callers can reference nodes consistently.
+        node_id = str(data.get("hash") or "").strip()
+        if not node_id:
+            raw = json.dumps({"type": node_type, "data": data}, sort_keys=True, ensure_ascii=False)
+            node_id = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
         if node_id in self.nodes:
             return node_id
         self.nodes[node_id] = {"type": node_type, **data}
@@ -168,19 +171,37 @@ class KnowledgeIngest:
             "status": "ingested",
         }
         file_path.write_text(self._render_note(meta, content), encoding="utf-8")
-        node_id = None
+        node_id = meta["hash"]
+        self.graph.add_node(
+            node_type="knowledge",
+            data={
+                "title": title,
+                "source": source,
+                "hash": content_hash,
+                "path": str(file_path),
+                "tags": tags,
+                "created": meta.get("created"),
+                "preview": content[:500],
+            },
+        )
         if self.memory and hasattr(self.memory, "add_node"):
-            node_id = self.memory.add_node("knowledge", meta)
+            try:
+                self.memory.add_node("knowledge", meta)
+            except Exception:
+                pass
         if self.event_bus:
-            self.event_bus.emit(
-                "KNOWLEDGE_INGESTED",
-                {
-                    "source": source,
-                    "node_id": node_id,
-                    "hash": content_hash,
-                    "path": str(file_path),
-                },
-            )
+            try:
+                self.event_bus.emit(
+                    "KNOWLEDGE_INGESTED",
+                    {
+                        "source": source,
+                        "node_id": node_id,
+                        "hash": content_hash,
+                        "path": str(file_path),
+                    },
+                )
+            except Exception:
+                pass
         return {"ok": True, "path": str(file_path), "node_id": node_id, "hash": content_hash}
 
     def ingest_url(
@@ -234,18 +255,9 @@ class KnowledgeIngest:
         node_b: Optional[str] = None,
         path_a: Optional[str] = None,
         path_b: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        a_id = node_a_hash or node_a or (self._path_to_node_id(path_a) if path_a else None)
-        b_id = node_b_hash or node_b or (self._path_to_node_id(path_b) if path_b else None)
-        # fallback mínimo quando vier path puro, permitindo link por conhecimento já ingerido
-        if not a_id:
-            candidates_a = self.search_knowledge(path_a or node_a or "").get("results", [])
-            if candidates_a:
-                a_id = candidates_a[0].get("hash") or candidates_a[0].get("id")
-        if not b_id:
-            candidates_b = self.search_knowledge(path_b or node_b or "").get("results", [])
-            if candidates_b:
-                b_id = candidates_b[0].get("hash") or candidates_b[0].get("id")
+    ) -> Dict[str, object]:
+        a_id = node_a_hash or node_a or (path_a and self._path_to_node_id(path_a))
+        b_id = node_b_hash or node_b or (path_b and self._path_to_node_id(path_b))
         if not a_id or not b_id:
             return {"ok": False, "error": "could not resolve both endpoints"}
         if self.memory and hasattr(self.memory, "add_edge"):
