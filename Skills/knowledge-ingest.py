@@ -13,6 +13,7 @@ class KnowledgeGraph:
         self.graph_path = graph_path
         self.nodes: Dict[str, Dict[str, Any]] = {}
         self.edges: List[Dict[str, Any]] = []
+        self.version: Optional[str] = None
         self._load()
 
     def _load(self) -> None:
