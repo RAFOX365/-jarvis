@@ -47,3 +47,8 @@ node_modules/
 *.mp3
 *.wav
 /Downloads/
+
+# JARVIS: versionar graph, ignorar só artefactos temporários
+Learnings/KnowledgeGraph/*.tmp.jsonl
+Learnings/KnowledgeGraph/*.bak.jsonl
+Imports/**/*.tmp
