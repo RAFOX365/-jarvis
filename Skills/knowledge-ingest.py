@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+GRAPH_SCHEMA_VERSION = "1.0.0"
+
+
 class KnowledgeGraph:
     def __init__(self, graph_path: Path) -> None:
         self.graph_path = graph_path
@@ -19,7 +22,21 @@ class KnowledgeGraph:
     def _load(self) -> None:
         if not self.graph_path.exists():
             return
-        for line in self.graph_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        lines = self.graph_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        if not lines:
+            return
+        first = lines[0].strip()
+        entry = None
+        try:
+            entry = json.loads(first)
+        except json.JSONDecodeError:
+            entry = None
+        if isinstance(entry, dict) and entry.get("type") == "graph_header" and entry.get("version"):
+            self.version = str(entry.get("version"))
+            start = 1
+        else:
+            start = 0
+        for line in lines[start:]:
             line = line.strip()
             if not line:
                 continue
@@ -34,6 +51,49 @@ class KnowledgeGraph:
                     self.nodes[node_id] = entry.get("data", {})
             elif etype == "edge":
                 self.edges.append(entry)
+
+    def _write_header(self) -> None:
+        if self.graph_path.exists() and self.graph_path.read_text(encoding="utf-8", errors="ignore").strip():
+            return
+        self.graph_path.parent.mkdir(parents=True, exist_ok=True)
+        header = {"type": "graph_header", "version": GRAPH_SCHEMA_VERSION}
+        self.graph_path.write_text(json.dumps(header, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    def rebuild_index(self, force: bool = False) -> Dict[str, Any]:
+        if not self.graph_path.exists():
+            return {"ok": True, "action": "skip", "reason": "graph file missing"}
+        report: Dict[str, Any] = {"ok": False, "orphan_nodes": 0, "orphan_edges": 0, "backup": None}
+        node_ids = set(self.nodes)
+        orphan_edges = 0
+        for edge in self.edges:
+            src = edge.get("source")
+            tgt = edge.get("target")
+            if src not in node_ids or tgt not in node_ids:
+                orphan_edges += 1
+        if orphan_edges:
+            report["error"] = "orphan edges detected, aborting rebuild"
+            report["orphan_edges"] = orphan_edges
+            if not force:
+                return report
+        backup_path = self.graph_path.with_suffix(self.graph_path.suffix + ".bak")
+        try:
+            shutil.copy2(self.graph_path, backup_path)
+            report["backup"] = str(backup_path)
+        except Exception as exc:
+            report["error"] = f"backup failed: {exc}"
+            if not force:
+                return report
+        lines = [json.dumps({"type": "graph_header", "version": GRAPH_SCHEMA_VERSION}, ensure_ascii=False)]
+        for node_id, node in self.nodes.items():
+            lines.append(json.dumps({"type": "node", "id": node_id, "data": node}, ensure_ascii=False, sort_keys=True))
+        for edge in self.edges:
+            lines.append(json.dumps({"type": "edge", **edge}, ensure_ascii=False, sort_keys=True))
+        self.graph_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        report["ok"] = True
+        report["action"] = "rebuild"
+        report["file"] = str(self.graph_path)
+        report["lines"] = len(lines)
+        return report
 
     def add_node(self, node_type: str, data: Dict[str, Any]) -> Optional[str]:
         # Prefer canonical hash from payload so callers can reference nodes consistently.
