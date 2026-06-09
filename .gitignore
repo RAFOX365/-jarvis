@@ -1,6 +1,6 @@
 # JARVIS .gitignore
 
-# Snaps e backups
+# Backups/artefatos temporários
 /Snapshots/
 /_latest
 
@@ -52,3 +52,6 @@ node_modules/
 Learnings/KnowledgeGraph/*.tmp.jsonl
 Learnings/KnowledgeGraph/*.bak.jsonl
 Imports/**/*.tmp
+
+# Configs sensíveis
+Config/openrouter.json
