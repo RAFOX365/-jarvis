@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import urllib.request, urllib.error
 
 
 class _OpenRouterSkill:
@@ -57,6 +58,8 @@ class _OpenRouterSkill:
         return {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/RAFOX365/-jarvis",
+            "X-Title": "JARVISHub",
         }
 
     def _choose_model(self, preferred: Optional[str]) -> Tuple[str, Optional[str]]:
@@ -82,6 +85,7 @@ class _OpenRouterSkill:
         api_key = self._get_api_key()
         if not api_key:
             return {"ok": False, "error": "openrouter api key missing"}
+
         chosen, fallback_model = self._choose_model(model)
         headers = self._get_headers()
         body: Dict[str, Any] = {
@@ -91,41 +95,14 @@ class _OpenRouterSkill:
             "max_tokens": max_tokens,
         }
         try:
-            import urllib.request
-            req = urllib.request.Request(
-                "https://openrouter.ai/api/v1/chat/completions",
-                data=json.dumps(body).encode("utf-8"),
+            return self._post_chat_completion(
+                url="https://openrouter.ai/api/v1/chat/completions",
                 headers=headers,
-                method="POST",
+                body=body,
+                fallback_model=fallback_model,
             )
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
         except Exception as exc:
-            if fallback_model and fallback_model != chosen:
-                body["model"] = fallback_model
-                try:
-                    req = urllib.request.Request(
-                        "https://openrouter.ai/api/v1/chat/completions",
-                        data=json.dumps(body).encode("utf-8"),
-                        headers=headers,
-                        method="POST",
-                    )
-                    with urllib.request.urlopen(req, timeout=60) as resp:
-                        data = json.loads(resp.read().decode("utf-8"))
-                except Exception as exc2:
-                    return {"ok": False, "error": str(exc2)}
-            else:
-                return {"ok": False, "error": str(exc)}
-        try:
-            content = data["choices"][0]["message"]["content"]
-        except Exception:
-            content = ""
-        return {
-            "ok": True,
-            "model": chosen,
-            "content": content,
-            "raw": data,
-        }
+            return {"ok": False, "error": str(exc)}
 
     def list_models(self) -> Dict[str, Any]:
         api_key = self._get_api_key()
@@ -133,7 +110,6 @@ class _OpenRouterSkill:
             return {"ok": False, "error": "openrouter api key missing"}
         headers = self._get_headers()
         try:
-            import urllib.request
             req = urllib.request.Request(
                 "https://openrouter.ai/api/v1/models",
                 headers=headers,
@@ -141,6 +117,13 @@ class _OpenRouterSkill:
             )
             with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            return {
+                "ok": False,
+                "error": str(exc),
+                "http_status": exc.code,
+                "body": exc.read().decode("utf-8", errors="ignore"),
+            }
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "models": data}
@@ -152,6 +135,80 @@ class _OpenRouterSkill:
             "configured": bool(api_key),
             "primary": self.config.get("primary"),
             "fallback": self.config.get("fallback"),
+        }
+
+    def _post_chat_completion(
+        self,
+        url: str,
+        headers: Dict[str, str],
+        body: Dict[str, Any],
+        fallback_model: Optional[str],
+    ) -> Dict[str, Any]:
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(body).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = {
+                "ok": False,
+                "error": str(exc),
+                "http_status": exc.code,
+                "body": exc.read().decode("utf-8", errors="ignore"),
+            }
+            if (
+                fallback_model
+                and fallback_model != body.get("model")
+                and exc.code in (404, 429, 500, 502, 503)
+            ):
+                body = dict(body)
+                body["model"] = fallback_model
+                try:
+                    req = urllib.request.Request(
+                        url,
+                        data=json.dumps(body).encode("utf-8"),
+                        headers=headers,
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                except urllib.error.HTTPError as exc2:
+                    detail["fallback_error"] = str(exc2)
+                    detail["fallback_http_status"] = exc2.code
+                    detail["fallback_body"] = exc2.read().decode("utf-8", errors="ignore")
+                    return detail
+                except Exception as exc2:
+                    detail["fallback_error"] = str(exc2)
+                    return detail
+
+                try:
+                    content = data["choices"][0]["message"]["content"]
+                except Exception:
+                    content = ""
+                return {
+                    "ok": True,
+                    "model": fallback_model,
+                    "content": content,
+                    "raw": data,
+                    "fallback_used": True,
+                }
+            return detail
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except Exception:
+            content = ""
+        return {
+            "ok": True,
+            "model": body.get("model"),
+            "content": content,
+            "raw": data,
         }
 
     def _execute(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
